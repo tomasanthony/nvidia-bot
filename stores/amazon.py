@@ -3,6 +3,7 @@ import secrets
 import time
 from os import path
 
+from amazoncaptcha import AmazonCaptcha
 from chromedriver_py import binary_path  # this will get you the path variable
 from furl import furl
 from selenium import webdriver
@@ -10,16 +11,16 @@ from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 
-from notifications.notifications import NotificationHandler
 from utils import selenium_utils
 from utils.json_utils import InvalidAutoBuyConfigException
 from utils.logger import log
 from utils.selenium_utils import options, enable_headless, wait_for_element
 
 AMAZON_URLS = {
-    "BASE_URL": "https://www.{}/",
-    "CART_URL": "https://www.{}/gp/aws/cart/add.html",
+    "BASE_URL": "https://www.{domain}/",
+    "CART_URL": "https://www.{domain}/gp/aws/cart/add.html",
 }
+CHECKOUT_URL = "https://www.{domain}/gp/cart/desktop/go-to-checkout.html/ref=ox_sc_proceed?partialCheckoutCart=1&isToBeGiftWrappedBefore=0&proceedToRetailCheckout=Proceed+to+checkout&proceedToCheckout=1&cartInitiateId={cart_id}"
 
 AUTOBUY_CONFIG_PATH = "amazon_config.json"
 
@@ -27,36 +28,55 @@ SIGN_IN_TITLES = ["Amazon Sign In", "Amazon Sign-In", "Amazon Anmelden"]
 CAPTCHA_PAGE_TITLES = ["Robot Check"]
 HOME_PAGE_TITLES = [
     "Amazon.com: Online Shopping for Electronics, Apparel, Computers, Books, DVDs & more",
+    "Amazon.ca: Low Prices – Fast Shipping – Millions of Items",
     "Amazon.co.uk: Low Prices in Electronics, Books, Sports Equipment & more",
     "Amazon.de: Low Prices in Electronics, Books, Sports Equipment & more",
+    "Amazon.de: Günstige Preise für Elektronik & Foto, Filme, Musik, Bücher, Games, Spielzeug & mehr",
     "Amazon.es: compra online de electrónica, libros, deporte, hogar, moda y mucho más.",
+    "Amazon.de: Günstige Preise für Elektronik & Foto, Filme, Musik, Bücher, Games, Spielzeug & mehr",
+    "Amazon.fr : livres, DVD, jeux vidéo, musique, high-tech, informatique, jouets, vêtements, chaussures, sport, bricolage, maison, beauté, puériculture, épicerie et plus encore !",
 ]
 SHOPING_CART_TITLES = [
     "Amazon.com Shopping Cart",
+    "Amazon.ca Shopping Cart",
     "Amazon.co.uk Shopping Basket",
     "Amazon.de Basket",
+    "Amazon.de Einkaufswagen",
     "Cesta de compra Amazon.es",
+    "Amazon.fr Panier",
 ]
 CHECKOUT_TITLES = [
     "Amazon.com Checkout",
+    "Amazon.co.uk Checkout",
+    "Place Your Order - Amazon.ca Checkout",
     "Place Your Order - Amazon.co.uk Checkout",
+    "Amazon.de Checkout",
     "Place Your Order - Amazon.de Checkout",
+    "Amazon.de - Bezahlvorgang",
     "Place Your Order - Amazon.com Checkout",
     "Place Your Order - Amazon.com",
     "Tramitar pedido en Amazon.es",
+    "Processus de paiement Amazon.com",
 ]
-ORDER_COMPLETE_TITLES = ["Amazon.com Thanks You", "Thank you"]
+ORDER_COMPLETE_TITLES = [
+    "Amazon.com Thanks You",
+    "Amazon.ca Thanks You",
+    "Thank you",
+    "Amazon.fr Merci",
+    "Merci",
+]
 ADD_TO_CART_TITLES = [
     "Amazon.com: Please Confirm Your Action",
     "Amazon.de: Bitte bestätigen Sie Ihre Aktion",
     "Amazon.de: Please Confirm Your Action",
     "Amazon.es: confirma tu acción",
+    "Amazon.com : Veuillez confirmer votre action",  # Careful, required non-breaking space after .com (&nbsp)
 ]
 
 
 class Amazon:
-    def __init__(self, headless=False):
-        self.notification_handler = NotificationHandler()
+    def __init__(self, notification_handler, headless=False):
+        self.notification_handler = notification_handler
         if headless:
             enable_headless()
         options.add_argument(f"user-data-dir=.profile-amz")
@@ -82,8 +102,7 @@ class Amazon:
             exit(0)
 
         for key in AMAZON_URLS.keys():
-            AMAZON_URLS[key] = AMAZON_URLS[key].format(self.amazon_website)
-        print(AMAZON_URLS)
+            AMAZON_URLS[key] = AMAZON_URLS[key].format(domain=self.amazon_website)
         self.driver.get(AMAZON_URLS["BASE_URL"])
         log.info("Waiting for home page.")
         self.check_if_captcha(self.wait_for_pages, HOME_PAGE_TITLES)
@@ -121,8 +140,10 @@ class Amazon:
             log.info("Email not needed.")
             pass
 
+        log.info("Remember me checkbox")
+        selenium_utils.button_click_using_xpath(self.driver, '//*[@name="rememberMe"]')
+
         log.info("Password")
-        self.driver.find_element_by_xpath('//input[@name="rememberMe"]').click()
         self.driver.find_element_by_xpath('//*[@id="ap_password"]').send_keys(
             self.password + Keys.RETURN
         )
@@ -134,7 +155,7 @@ class Amazon:
         while not self.something_in_stock():
             time.sleep(delay)
         self.notification_handler.send_notification(
-            "Your items on Amazon.com were found!"
+            "Your items on Amazon.com were found!", True
         )
         self.checkout(test=test)
 
@@ -157,22 +178,64 @@ class Amazon:
             return False
 
     def get_captcha_help(self):
-        log.info("Stuck on a captcha. Please help.")
-        self.notification_handler.send_notification("Amazon bot is stuck on a captcha!")
+        if not self.on_captcha_page():
+            log.info("Not on captcha page.")
+            return
+        try:
+            log.info("Stuck on a captcha... Lets try to solve it.")
+            captcha = AmazonCaptcha.fromdriver(self.driver)
+            solution = captcha.solve()
+            log.info(f"The solution is: {solution}")
+            if solution == "Not solved":
+                log.info(f"Failed to solve {captcha.image_link}, lets reload and get a new captcha.")
+                self.driver.refresh()
+                time.sleep(5)
+                self.get_captcha_help()
+            else:
+                self.driver.save_screenshot("screenshot.png")
+                self.notification_handler.send_notification(
+                    f"Solving Captcha: {solution}", True
+                )
+                self.driver.find_element_by_xpath(
+                    '//*[@id="captchacharacters"]'
+                ).send_keys(solution + Keys.RETURN)
+        except Exception as e:
+            log.debug(e)
+            log.info("Error trying to solve captcha. Refresh and retry.")
+            self.driver.refresh()
+            time.sleep(5)
+
+    def on_captcha_page(self):
+        try:
+            if self.driver.title in CAPTCHA_PAGE_TITLES:
+                return True
+            if self.driver.find_element_by_xpath(
+                '//form[@action="/errors/validateCaptcha"]'
+            ):
+                return True
+        except Exception:
+            pass
+        return False
 
     def check_if_captcha(self, func, args):
         try:
             func(args)
         except Exception as e:
-            if self.driver.title in CAPTCHA_PAGE_TITLES:
+            log.debug(str(e))
+            if self.on_captcha_page():
                 self.get_captcha_help()
                 func(args, t=300)
             else:
+                log.debug(self.driver.title)
                 log.error(
                     f"An error happened, please submit a bug report including a screenshot of the page the "
                     f"selenium browser is on. There may be a file saved at: amazon-{func.__name__}.png"
                 )
                 self.driver.save_screenshot(f"amazon-{func.__name__}.png")
+                self.driver.save_screenshot("screenshot.png")
+                self.notification_handler.send_notification(
+                    f"Error on {self.driver.title}", True
+                )
                 time.sleep(60)
                 self.driver.close()
                 raise e
@@ -207,7 +270,7 @@ class Amazon:
                 log.debug(f"{button_xpath}, lets try a different one.")
 
         if button:
-            log.info(f"Clicking Button: {button}")
+            log.info(f"Clicking Button: {button.text}")
             if not test:
                 button.click()
             return
@@ -231,23 +294,52 @@ class Amazon:
 
     def checkout(self, test):
         log.info("Clicking continue.")
+        self.driver.save_screenshot("screenshot.png")
+        self.notification_handler.send_notification("Starting Checkout", True)
         self.driver.find_element_by_xpath('//input[@value="add"]').click()
 
         log.info("Waiting for Cart Page")
         self.check_if_captcha(self.wait_for_pages, SHOPING_CART_TITLES)
+        self.driver.save_screenshot("screenshot.png")
+        self.notification_handler.send_notification("Cart Page", True)
 
-        log.info("clicking checkout.")
-        self.driver.find_element_by_xpath(
-            '//*[@id="sc-buy-box-ptc-button"]/span/input'
-        ).click()
+        try:  # This is fast.
+            log.info("Quick redirect to checkout page")
+            cart_initiate_id = self.driver.find_element_by_name("cartInitiateId")
+            cart_initiate_id = cart_initiate_id.get_attribute("value")
+            self.driver.get(
+                CHECKOUT_URL.format(
+                    domain=self.amazon_website, cart_id=cart_initiate_id
+                )
+            )
+        except:
+            log.info("clicking checkout.")
+            try:
+                self.driver.find_element_by_xpath(
+                    '//*[@id="sc-buy-box-ptc-button"]/span/input'
+                ).click()
+            finally:
+                self.driver.save_screenshot("screenshot.png")
+                self.notification_handler.send_notification(
+                    "Failed to checkout. Returning to stock check.", True
+                )
+                log.info("Failed to checkout. Returning to stock check.")
+                self.run_item(test=test)
 
         log.info("Waiting for Place Your Order Page")
         self.wait_for_pyo_page()
 
         log.info("Finishing checkout")
+        self.driver.save_screenshot("screenshot.png")
+        self.notification_handler.send_notification("Finishing checkout", True)
+
         self.finalize_order_button(test)
 
         log.info("Waiting for Order completed page.")
         self.wait_for_order_completed(test)
 
         log.info("Order Placed.")
+        self.driver.save_screenshot("screenshot.png")
+        self.notification_handler.send_notification("Order Placed", True)
+
+        time.sleep(20)
